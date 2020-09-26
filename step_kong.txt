@@ -1,0 +1,181 @@
+# Demo menggunakan kubernetes yang single cluster dengan menggunakan minikube
+
+####################################
+## deploy Kong ingress controller ##
+####################################
+
+
+#1. Deploy kong using kubectl
+
+#kubectl create -f https://bit.ly/k4k8s
+
+kubectl create namespace kong
+kubectl create namespace monitoring
+kubectl create namespace sample-app
+
+## using helm
+helm repo add kong https://charts.konghq.com
+helm repo update
+
+
+# helm 2
+helm install kong/kong --namespace kong --name mykong  --values https://bit.ly/2UAv0ZE
+
+
+# helm 3
+helm install kong kong/kong --namespace kong  --values https://bit.ly/2UAv0ZE --set ingressController.installCRDs=false
+
+## with option prometeus
+
+#2. Export proxy IP
+export PROXY_IP=$(minikube service -n kong kong-proxy --url | head -1)
+echo $PROXY_IP
+
+# alternatif
+export PROXY_IP=$(kubectl get -o jsonpath="{.status.loadBalancer.ingress[0].ip}" service -n kong kong-proxy)
+echo $PROXY_IP
+
+
+#####################
+### Sample app ######
+#####################
+
+#1. deploy echo server app
+kubectl apply -f echo-app.yml
+kubectl get pods
+
+#2. Create basic ingress
+echo "
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: demo
+  namespace: sample-app
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /foo
+        backend:
+          serviceName: echo
+          servicePort: 80
+" | kubectl apply -f -
+
+###
+curl -i $PROXY_IP/foo
+
+#3. Using plugin
+
+#A. Using plugin in Kong
+# exaple using correlation-id plugin
+
+## create kongplugin resource
+echo "
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: request-id
+  namespace: sample-app
+config:
+  header_name: my-request-id
+plugin: correlation-id
+" | kubectl apply -f -
+
+
+# Create new ingress using plugin
+echo "
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: demo-example-com
+  namespace: sample-app
+  annotations:
+    konghq.com/plugins: request-id
+spec:
+  rules:
+  - host: example.com
+    http:
+      paths:
+      - path: /bar
+        backend:
+          serviceName: echo
+          servicePort: 80
+" | kubectl apply -f - 
+
+# test
+curl -i -H "Host: example.com" $PROXY_IP/bar/sample
+
+#B. Using plugins on Services
+# example using rate-limiting plugin
+
+# create Kong plugin resource
+echo "
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: rl-by-ip
+  namespace: sample-app
+config:
+  minute: 5
+  limit_by: ip
+  policy: local
+plugin: rate-limiting
+" | kubectl apply -f -
+
+# appy to services
+kubectl patch svc echo -n sample-app\
+  -p '{"metadata":{"annotations":{"konghq.com/plugins": "rl-by-ip\n"}}}'
+
+curl -I $PROXY_IP/foo
+curl -I -H "Host: example.com" $PROXY_IP/bar/sample
+
+
+#############################################
+### Monitoring with prometheus and grafana ###
+#############################################
+
+
+#1. Install prometheus and grafana
+## with interval 10 second
+helm install prometheus stable/prometheus --namespace monitoring --values https://bit.ly/2RgzDtg --version 11.0.3
+
+#or 
+kubectl create -f datasource-config.yml
+kubectl create -f deployment.yml
+kubectl create -f service.yml
+
+
+#2. Create kong plugin resource
+
+echo 'apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: prometheus	
+  labels:
+    global: "true"
+plugin: prometheus
+' | kubectl apply -f -
+
+
+
+#3. Assign to services
+
+kubectl patch svc echo -n sample-app\
+  -p '{"metadata":{"annotations": {"konghq.com/strip-path": "true\n"}}}'
+
+export MONITOR_IP=$(minikube service -n monitoring grafana --url | head -1)
+
+user : admin, password : admin
+
+template : 7424
+
+#4. Test
+
+while true;
+do
+  curl -I $PROXY_IP/foo
+  curl -I -H "Host: example.com" $PROXY_IP/bar/sample
+  sleep 0.01
+done
+
+ab -n 10000 -c 1000 $PROXY_IP/foo
